@@ -1,0 +1,131 @@
+event-handler revertToZtp
+    action bash
+#!/usr/bin/python
+# Copyright (c) 2025 Arista Networks, Inc.  All rights reserved.
+# Arista Networks, Inc. Confidential and Proprietary.
+from __future__ import print_function
+import os
+import sys
+if (os.path.exists("/usr/bin/arista-python") and
+    os.path.realpath(sys.executable) != os.path.realpath("/usr/bin/arista-python")):
+    os.execl("/usr/bin/arista-python", "python3", os.path.abspath(__file__ ))
+import datetime
+import re
+import requests
+import subprocess
+import time
+from distutils.version import LooseVersion
+MIN_TA_VER = "1.30.0"
+MAX_TA_VER = "1.42.0"
+STARTUP_CONFIG_PATH = "/mnt/flash/startup-config"
+# This file is created by CV during the ZTP bootstrap script execution, as the device is
+# provisioned using change control.
+REVERT_TO_ZTP_STATE_PATH = "/persist/sys/.revertToZtpState"
+TA_CONNECTIVITY_FALLBACK_LOG_FILE_PATH = "/mnt/flash/terminattr_connectivity_fallback_log"
+TIMEOUT_SECONDS = 300   # Timeout after which the script will fallback to the zerotouch mode
+def isTerminAttrSupported():
+    """
+    Checks if the running TerminAttr version is between min and max version where this
+    event handler is supported.
+    """
+    try:
+        currVersionOutput = subprocess.check_output(["rpm", "-q", "TerminAttr-core",
+            "--queryformat", "%{VERSION}-%{RELEASE}"], universal_newlines=True)
+        if currVersionOutput.startswith("v"):
+            currVersionOutput = currVersionOutput[len("v"):]
+        match = re.search(r"^(\d+)\.(\d+)\.(\d+)(.*)", currVersionOutput)
+        if not match:
+            print("Unable to parse the TerminAttr version {ver}".format(ver=currVersionOutput))
+            return False
+        parsedCurrVer = ".".join(list(match.groups())[:3])
+        print("Parsed Current TerminAttr Version: {ver}".format(ver=parsedCurrVer))
+        return (LooseVersion(parsedCurrVer) >= LooseVersion(MIN_TA_VER) and
+                LooseVersion(parsedCurrVer) < LooseVersion(MAX_TA_VER))
+    except subprocess.CalledProcessError as e:
+        msg = "rpm -q TerminAttr-core --queryformat %{VERSION}-%{RELEASE}"
+        print("Error running '{m}'. Aborting. Error: {err}".format(m=msg, err=str(e)))
+        return False
+def shouldRunConnectivityFallback():
+    """
+    Only run connectivity fallback check if both the startup-config and revertToZtpState
+    files exist, which denotes that the device just came out of the zerotouch mode after
+    config push via CV.
+    """
+    return os.path.exists(REVERT_TO_ZTP_STATE_PATH) and os.path.exists(STARTUP_CONFIG_PATH)
+def main():
+    if not isTerminAttrSupported():
+        print("This event handler is only supported for TerminAttr releases [1.30.0, 1.42.0). Exiting.")
+        return
+    if not shouldRunConnectivityFallback():
+        print("CloudVision ZTP connectivity fallback check already ran before. Exiting.")
+        return
+    startTime = time.time()
+    while time.time() - startTime < TIMEOUT_SECONDS:
+        try:
+            # Iterate through all connections. For each connection, look whether the
+            # connection state is "connected". If yes, for the same connection, look
+            # up the streaming state. If it is "connected", the device is connected
+            # and we never need to run again
+            taResp = requests.get("http://localhost:6060/rest/Eos/TerminAttr/")
+            taResp.raise_for_status()  # Raise an error for HTTP errors
+            taRespJson = taResp.json()
+            print("Response from TA:", taRespJson)
+            connectionColl = taRespJson.get("connection", {})
+            for connName, connVal in connectionColl.items():
+                connPtr = connVal.get("_ptr")
+                if connPtr is None:
+                    continue
+                # Note: _ptr starts with `/`
+                connResp = requests.get(
+                    "http://localhost:6060/rest{connPtr}".format(connPtr=connPtr))
+                connResp.raise_for_status()
+                connRespJson = connResp.json()
+                print("Response from the connection {connName}:".format(connName=connName), connRespJson)
+                if connRespJson.get("State") != "connected":
+                    continue
+                # Ideally streaming state collection will only have one key which is cvopts
+                # options passed to TA, even in case of multi-node clusters.
+                streamingStateColl = taRespJson.get("streamingState", {})
+                for streamingConnName, streamingConnVal in streamingStateColl.items():
+                    if connName not in streamingConnName:
+                        continue
+                    streamingPtr = streamingConnVal.get("_ptr")
+                    if streamingPtr is None:
+                        continue
+                    streamingResp = requests.get(
+                        "http://localhost:6060/rest{streamingPtr}".format(streamingPtr=streamingPtr))
+                    streamingResp.raise_for_status()
+                    streamingRespJson = streamingResp.json()
+                    print("Response from the streamingState {connName}:".format(connName=connName), streamingRespJson)
+                    if streamingRespJson.get("State") == "connected":
+                        # Delete the REVERT_TO_ZTP_STATE_PATH so that the handler won't run again
+                        os.remove(REVERT_TO_ZTP_STATE_PATH)
+                        print("Device streaming. Handler won't run again.")
+                        return
+        except requests.exceptions.RequestException as e:
+            print("Device is not streaming yet, err: {ex}".format(ex=str(e)))
+            time.sleep(5)
+        except Exception as e:
+            print("Unknown exception occurred: {ex}".format(ex=str(e)))
+    # Device hasn't streamed. Config is broken, put it back in ZTP mode.
+    print("Device has lost its connectivity. Rebooting with write erase.")
+    # Append the reboot timestamp to this file
+    nowUtc = datetime.datetime.utcnow()
+    rfc3339Time = nowUtc.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    with open(TA_CONNECTIVITY_FALLBACK_LOG_FILE_PATH, "a") as f:
+        f.write("{rfc3339Time}\n".format(rfc3339Time=rfc3339Time))
+    # 'reload all now' (as opposed to just 'reload now') is needed for dual sup like systems,
+    # but it works for fixed SKUs too, so we use it to keep things simple.
+    subprocess.check_output("FastCli -p 15 -c $\'enable\\n write erase\\n reload all now\'", shell=True)
+if __name__ == "__main__":
+    main()
+EOF
+    ! Trigger for TerminAttr process starting
+    trigger on-logging
+        regex .*PROCESS_STARTED.*TerminAttr
+    ! We don't want the event handler to run more than once if TA keeps on restarting.
+    ! So we set the interval here to the TA connectivity timeout.
+    ! Also, setting the count as 1 makes the event handler run after 320s for the first time,
+    ! so instead we set it to 2.
+    repeat interval 320 count 2
+!
