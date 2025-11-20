@@ -65,7 +65,7 @@ def main():
             # Iterate through all connections. For each connection, look whether the
             # connection state is "connected". If yes, for the same connection, look
             # up the streaming state. If it is "connected", the device is connected
-            # and we never need to run again
+            # and the action never need to run again
             taResp = requests.get("http://localhost:6060/rest/Eos/TerminAttr/")
             taResp.raise_for_status()  # Raise an error for HTTP errors
             taRespJson = taResp.json()
@@ -115,17 +115,16 @@ def main():
     with open(TA_CONNECTIVITY_FALLBACK_LOG_FILE_PATH, "a") as f:
         f.write("{rfc3339Time}\n".format(rfc3339Time=rfc3339Time))
     # 'reload all now' (as opposed to just 'reload now') is needed for dual sup like systems,
-    # but it works for fixed SKUs too, so we use it to keep things simple.
+    # but it works for fixed SKUs too, so this is done to keep things simple.
     subprocess.check_output("FastCli -p 15 -c $\'enable\\n write erase\\n reload all now\'", shell=True)
 if __name__ == "__main__":
     main()
 EOF
-    ! Trigger for TerminAttr process starting
-    trigger on-logging
-        regex .*PROCESS_STARTED.*TerminAttr
-    ! We don't want the event handler to run more than once if TA keeps on restarting.
-    ! So we set the interval here to the TA connectivity timeout.
-    ! Also, setting the count as 1 makes the event handler run after 320s for the first time,
-    ! so instead we set it to 2.
-    repeat interval 320 count 2
+    ! Trigger for on boot. This is ideally triggered when EventMgr agent warms up after
+    ! reboot, and the TerminAttr daemon is also expected to start around the same time.
+    trigger on-boot
+    ! Since the action takes 5 minutes, increase the timeout
+    timeout 320
+    ! Make the action asynchronous so that it doesn't block actions from other event-handlers
+    asynchronous
 !
