@@ -28,7 +28,7 @@
               type: INPUT_FIELD_TYPE_STRING
               name: dummyTextBox
               label: dummyTextBox
-              description: Does not require any input
+              description: Requires entering any dummy text to trigger the Studio for the first time
               required: false
               boolean_props: null
               integer_props: null
